@@ -15,26 +15,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-
       - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip
           python -m pip install -r part2/backend/requirements.txt
           python -m pip install -r part2/frontend/requirements.txt
 
       - name: Run Backend and Test Predict Batch
         run: |
           cd part2/backend
-          # Use uvicorn to run the FastAPI app instead of direct python execution
-          python -m uvicorn main:app --host 0.0.0.0 --port 8000 &
+          python backend.py &
           BACKEND_PID=$!
 
           for i in {1..20}; do
-            if curl -s http://localhost:8000/health | grep -q '"status":"healthy"'; then
+            if curl -s http://localhost:8000/health | grep -q healthy; then
               echo "Backend is up!"
               break
             fi
@@ -45,35 +38,31 @@ jobs:
             'http://localhost:8000/predict_batch' \
             -H 'accept: application/json' \
             -H 'Content-Type: multipart/form-data' \
-            -F 'file=@../../data/bank-sample.csv;type=text/csv')
+            -F 'file=@../data/bank-sample.csv;type=text/csv')
 
           if [ "$RESPONSE" -eq 200 ]; then
             echo "predict_batch endpoint test passed."
           else
             echo "predict_batch endpoint test failed with status $RESPONSE"
             cat response.json
-            kill $BACKEND_PID 2>/dev/null || true
+            kill $BACKEND_PID
             exit 1
           fi
 
-          kill $BACKEND_PID 2>/dev/null || true
+          kill $BACKEND_PID
 
   generate-report:
     needs: run-tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Required for git push to work
-
-      - name: Install jq
-        run: sudo apt-get install -y jq
+      - uses: actions/setup-node@v4
 
       - name: Generate Report
         run: | 
-          precision=$(jq -r '.precision' part2/models/best/metadata.json)
-          recall=$(jq -r '.recall' part2/models/best/metadata.json)
-          f1=$(jq -r '.f1' part2/models/best/metadata.json)
+          precision=$(jq '.precision' part2/models/best/metadata.json)
+          recall=$(jq '.recall' part2/models/best/metadata.json)
+          f1=$(jq '.f1' part2/models/best/metadata.json)
           model_type=$(jq -r '.model_filename' part2/models/best/metadata.json | sed -E 's/model_(.*)\.joblib/\1/')
 
           mkdir -p part2/reports
@@ -91,6 +80,7 @@ jobs:
 
           echo "## Metrics" >> "$report_path"
           echo "" >> "$report_path"
+          # Possible error
           echo "| Metric    | Value |" >> "$report_path"
           echo "|-----------|-------|" >> "$report_path"
           echo "| Precision | $precision |" >> "$report_path"
@@ -100,15 +90,9 @@ jobs:
 
           echo "## Images" >> "$report_path"
           echo "" >> "$report_path"
-          # Create images directory in reports and copy images
-          mkdir -p part2/reports/images
           for img in part2/models/best/*.png; do
-            if [ -f "$img" ]; then
-              img_name=$(basename "$img")
-              cp "$img" part2/reports/images/
-              echo "![$img_name](images/$img_name)" >> "$report_path"
-              echo "" >> "$report_path"
-            fi
+            rel_path=$(realpath --relative-to=reports "$img")
+            echo "![Image]($rel_path)" >> "$report_path"
           done
 
       - name: Commit and push changes
@@ -118,11 +102,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add part2/reports/
-          # Check if there are changes to commit
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "chore: auto-generate model report [skip ci]"
-            git push origin HEAD:${{ github.ref_name }}
-          fi
+          git add part2/reports/best_model_report.md
+          # Possible error
+          git commit -m "Add generated model report"
+          git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git HEAD:${{ github.ref_name }}
