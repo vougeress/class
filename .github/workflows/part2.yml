@@ -1,0 +1,199 @@
+name: Advanced Workflow
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'models/**'
+      - 'backend/**'
+      - 'data/**'
+  workflow_dispatch:
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r part2/backend/requirements.txt
+          python -m pip install -r part2/frontend/requirements.txt
+
+      - name: Run Backend and Test Predict Batch
+        run: |
+          cd part2/backend
+          
+          # Start the backend server in background
+          python -m uvicorn main:app --host 0.0.0.0 --port 8000 &
+          BACKEND_PID=$!
+
+          # Wait for backend to start
+          echo "Waiting for backend to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8000/health | grep -q '"status":"healthy"'; then
+              echo "Backend is up!"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "Backend failed to start within 30 seconds"
+              kill $BACKEND_PID 2>/dev/null || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # Test the predict_batch endpoint
+          echo "Testing predict_batch endpoint..."
+          RESPONSE=$(curl -s -o response.json -w "%{http_code}" -X 'POST' \
+            'http://localhost:8000/predict_batch' \
+            -H 'accept: application/json' \
+            -H 'Content-Type: multipart/form-data' \
+            -F 'file=@../../data/bank-sample.csv;type=text/csv')
+
+          if [ "$RESPONSE" -eq 200 ]; then
+            echo "✅ predict_batch endpoint test passed."
+            cat response.json
+          else
+            echo "❌ predict_batch endpoint test failed with status $RESPONSE"
+            cat response.json
+            kill $BACKEND_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Test the health endpoint
+          echo "Testing health endpoint..."
+          HEALTH_RESPONSE=$(curl -s -w "%{http_code}" http://localhost:8000/health)
+          if [ "$HEALTH_RESPONSE" -eq 200 ]; then
+            echo "✅ Health endpoint test passed."
+          else
+            echo "❌ Health endpoint test failed with status $HEALTH_RESPONSE"
+            kill $BACKEND_PID 2>/dev/null || true
+            exit 1
+          fi
+
+          # Clean up
+          kill $BACKEND_PID 2>/dev/null || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            part2/backend/response.json
+            */response.json
+
+  generate-report:
+    needs: run-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Important for git push to work
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Generate Report
+        run: |
+          # Check if metadata file exists
+          if [ ! -f "part2/models/best/metadata.json" ]; then
+            echo "❌ Metadata file not found at part2/models/best/metadata.json"
+            exit 1
+          fi
+
+          # Extract metrics with default values if they don't exist
+          precision=$(jq -r '.precision // "N/A"' part2/models/best/metadata.json)
+          recall=$(jq -r '.recall // "N/A"' part2/models/best/metadata.json)
+          f1=$(jq -r '.f1 // "N/A"' part2/models/best/metadata.json)
+          model_type=$(jq -r '.model_filename // "unknown"' part2/models/best/metadata.json | sed -E 's/model_(.*)\.joblib/\1/')
+
+          # Create reports directory
+          mkdir -p part2/reports
+
+          # Copy images to reports directory for proper relative paths
+          mkdir -p part2/reports/images
+          for img in part2/models/best/*.png; do
+            if [ -f "$img" ]; then
+              cp "$img" part2/reports/images/
+            fi
+          done
+
+          report_path="part2/reports/best_model_report.md"
+
+          # Generate the report
+          echo "# Best Model Report" > "$report_path"
+          echo "" >> "$report_path"
+          echo "## Model Info" >> "$report_path"
+          echo "" >> "$report_path"
+          echo "- **Model Type**: $model_type" >> "$report_path"
+          echo "" >> "$report_path"
+
+          echo "## Parameters" >> "$report_path"
+          echo "" >> "$report_path"
+          jq -r '.params | to_entries[] | "- **\(.key)**: \(.value)"' part2/models/best/metadata.json >> "$report_path"
+          echo "" >> "$report_path"
+
+          echo "## Metrics" >> "$report_path"
+          echo "" >> "$report_path"
+          echo "| Metric | Value |" >> "$report_path"
+          echo "|--------|-------|" >> "$report_path"
+          echo "| Precision | $precision |" >> "$report_path"
+          echo "| Recall | $recall |" >> "$report_path"
+          echo "| F1 Score | $f1 |" >> "$report_path"
+          echo "" >> "$report_path"
+
+          # Add images section if any images exist
+          if [ "$(find part2/reports/images -name '*.png' | wc -l)" -gt 0 ]; then
+            echo "## Evaluation Plots" >> "$report_path"
+            echo "" >> "$report_path"
+            for img in part2/reports/images/*.png; do
+              img_name=$(basename "$img")
+              echo "![$img_name](images/$img_name)" >> "$report_path"
+              echo "" >> "$report_path"
+            done
+          fi
+
+          echo "## Test Results" >> "$report_path"
+          echo "" >> "$report_path"
+          echo "✅ All tests passed successfully!" >> "$report_path"
+          echo "" >> "$report_path"
+          echo "*Generated automatically on $(date)*" >> "$report_path"
+
+          # Show the generated report
+          cat "$report_path"
+
+      - name: Commit and push report
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Check if there are changes to commit
+          if git diff --quiet --exit-code; then
+            echo "No changes to commit"
+          else
+            git add part2/reports/
+            git commit -m "chore: auto-generate model report [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+
+      - name: Upload generated report
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-report
+          path: part2/reports/
